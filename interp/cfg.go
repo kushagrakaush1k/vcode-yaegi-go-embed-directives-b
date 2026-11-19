@@ -2275,7 +2275,9 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			}
 
 		case valueSpec:
-			n.gen = reset
+			if !n.rval.IsValid() {
+				n.gen = reset
+			}
 			l := len(n.child) - 1
 			if n.typ = n.child[l].typ; n.typ == nil {
 				if n.typ, err = nodeType(interp, sc, n.child[l]); err != nil {

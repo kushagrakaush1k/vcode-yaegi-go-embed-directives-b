@@ -366,7 +366,7 @@ func wrapInMain(src string) string {
 }
 
 func (interp *Interpreter) parse(src, name string, inc bool) (node ast.Node, err error) {
-	mode := parser.DeclarationErrors
+	mode := parser.DeclarationErrors | parser.ParseComments
 
 	// Allow incremental parsing of declarations or statements, by inserting
 	// them in a pseudo file package or function. Those statements or
@@ -379,13 +379,15 @@ func (interp *Interpreter) parse(src, name string, inc bool) (node ast.Node, err
 		case token.PACKAGE:
 			// nothing to do.
 		case token.CONST, token.FUNC, token.IMPORT, token.TYPE, token.VAR:
-			src = "package main;" + src
+			if strings.Contains(src, "//go:embed") {
+				src = "package main;\n" + src
+			} else {
+				src = "package main;" + src
+			}
 		default:
 			inFunc = true
 			src = wrapInMain(src)
 		}
-		// Parse comments in REPL mode, to allow tag setting.
-		mode |= parser.ParseComments
 	}
 
 	if ok, err := interp.buildOk(&interp.context, name, src); !ok || err != nil {
@@ -413,6 +415,13 @@ func (interp *Interpreter) parse(src, name string, inc bool) (node ast.Node, err
 	}
 
 	if inFunc {
+		for _, cg := range f.Comments {
+			for _, c := range cg.List {
+				if _, ok := isEmbedComment(c.Text); ok {
+					return nil, fmt.Errorf("%s: misplaced go:embed directive", interp.fset.Position(c.Pos()))
+				}
+			}
+		}
 		// return the body of the wrapper main function
 		return f.Decls[0].(*ast.FuncDecl).Body, nil
 	}
@@ -434,6 +443,7 @@ func (interp *Interpreter) ast(f ast.Node) (string, *node, error) {
 	var anc astNode
 	var st nodestack
 	pkgName := "main"
+	validEmbedComments := map[*ast.Comment]bool{}
 
 	addChild := func(root **node, anc astNode, pos token.Pos, kind nkind, act action) *node {
 		var i interface{}
@@ -899,6 +909,47 @@ func (interp *Interpreter) ast(f ast.Node) (string, *node, error) {
 			st.push(addChild(&root, anc, pos, kind, act), nod)
 
 		case *ast.ValueSpec:
+			var embedComments []*ast.Comment
+			if genDecl, ok := anc.ast.(*ast.GenDecl); ok && !genDecl.Lparen.IsValid() && genDecl.Doc != nil {
+				for _, c := range genDecl.Doc.List {
+					if _, ok := isEmbedComment(c.Text); ok {
+						embedComments = append(embedComments, c)
+					}
+				}
+			}
+			if a.Doc != nil {
+				for _, c := range a.Doc.List {
+					if _, ok := isEmbedComment(c.Text); ok {
+						embedComments = append(embedComments, c)
+					}
+				}
+			}
+			var embedPattern string
+			var hasEmbed bool
+			if len(embedComments) > 0 {
+				switch {
+				case anc.node == nil || anc.node.kind != varDecl || anc.node.anc == nil || anc.node.anc.kind != fileStmt:
+					err = astError(fmt.Errorf("%s: cannot apply go:embed to var inside func", interp.fset.Position(pos)))
+					return false
+				case len(a.Names) != 1:
+					err = astError(fmt.Errorf("%s: go:embed cannot apply to multiple vars", interp.fset.Position(pos)))
+					return false
+				case len(a.Values) > 0 || a.Type == nil:
+					err = astError(fmt.Errorf("%s: go:embed cannot apply to var with initializer", interp.fset.Position(pos)))
+					return false
+				case len(embedComments) > 1:
+					err = astError(fmt.Errorf("%s: go:embed cannot apply multiple directives to var", interp.fset.Position(pos)))
+					return false
+				}
+				arg, _ := isEmbedComment(embedComments[0].Text)
+				embedPattern, err = parseEmbedPattern(arg)
+				if err != nil {
+					err = astError(fmt.Errorf("%s: %w", interp.fset.Position(embedComments[0].Pos()), err))
+					return false
+				}
+				validEmbedComments[embedComments[0]] = true
+				hasEmbed = true
+			}
 			kind := valueSpec
 			act := aNop
 			switch {
@@ -926,6 +977,9 @@ func (interp *Interpreter) ast(f ast.Node) (string, *node, error) {
 			n := addChild(&root, anc, pos, kind, act)
 			n.nleft = len(a.Names)
 			n.nright = len(a.Values)
+			if hasEmbed {
+				n.meta = embedPattern
+			}
 			st.push(n, nod)
 
 		default:
@@ -935,8 +989,62 @@ func (interp *Interpreter) ast(f ast.Node) (string, *node, error) {
 		return true
 	})
 
+	if err == nil {
+		if file, ok := f.(*ast.File); ok {
+			for _, cg := range file.Comments {
+				for _, c := range cg.List {
+					if _, ok := isEmbedComment(c.Text); ok && !validEmbedComments[c] {
+						err = astError(fmt.Errorf("%s: misplaced go:embed directive", interp.fset.Position(c.Pos())))
+						break
+					}
+				}
+				if err != nil {
+					break
+				}
+			}
+		}
+	}
+
 	interp.roots = append(interp.roots, root)
 	return pkgName, root, err
+}
+
+func isEmbedComment(text string) (string, bool) {
+	if !strings.HasPrefix(text, "//go:embed") {
+		return "", false
+	}
+	rest := text[len("//go:embed"):]
+	if rest == "" {
+		return "", true
+	}
+	if rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\r' {
+		return strings.TrimSpace(rest), true
+	}
+	return "", false
+}
+
+func parseEmbedPattern(arg string) (string, error) {
+	if arg == "" {
+		return "", fmt.Errorf("invalid go:embed: missing pattern")
+	}
+	if arg[0] == '"' || arg[0] == '`' {
+		q, err := strconv.QuotedPrefix(arg)
+		if err != nil {
+			return "", fmt.Errorf("invalid go:embed: %w", err)
+		}
+		if strings.TrimSpace(arg[len(q):]) != "" {
+			return "", fmt.Errorf("invalid go:embed: multiple patterns not supported")
+		}
+		pat, err := strconv.Unquote(q)
+		if err != nil {
+			return "", fmt.Errorf("invalid go:embed: %w", err)
+		}
+		return pat, nil
+	}
+	if strings.ContainsAny(arg, " \t") {
+		return "", fmt.Errorf("invalid go:embed: multiple patterns not supported")
+	}
+	return arg, nil
 }
 
 type astNode struct {

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/traefik/yaegi/interp"
@@ -1929,4 +1930,316 @@ func TestIssue1623(t *testing.T) {
 		{desc: "pkg.J = 3", src: "pkg.J = 3; pkg.J", res: "3"},
 		{desc: `pkg.S = "bar"`, src: `pkg.S = "bar"; pkg.S`, res: "bar"},
 	})
+}
+
+func TestEmbed(t *testing.T) {
+	baseFS := fstest.MapFS{
+		"hello.txt":            &fstest.MapFile{Data: []byte("hello world")},
+		"bytes.bin":            &fstest.MapFile{Data: []byte{0x01, 0x02, 0x03, 0x04}},
+		"file with spaces.txt": &fstest.MapFile{Data: []byte("spaced content")},
+		"sub/only.dat":         &fstest.MapFile{Data: []byte("sub data")},
+		"sub/multi1.txt":       &fstest.MapFile{Data: []byte("m1")},
+		"sub/multi2.txt":       &fstest.MapFile{Data: []byte("m2")},
+		"app/sub/data.txt":     &fstest.MapFile{Data: []byte("relative to app/sub")},
+		"app/sub/main.go": &fstest.MapFile{Data: []byte(`package main
+
+import (
+	_ "embed"
+	"fmt"
+	"foo/bar"
+)
+
+var early = readBeforeInit()
+
+//go:embed data.txt
+var s string
+
+var (
+	//go:embed *.txt
+	b []byte
+	plain int
+)
+
+func readBeforeInit() string {
+	return s
+}
+
+func main() {
+	p := &s
+	b[0] = 'R'
+	fmt.Printf("%s|%s|%s|%d|%s", early, *p, string(b), plain, bar.Msg())
+}
+`)},
+		"_pkg/src/foo/bar/msg.txt": &fstest.MapFile{Data: []byte("from pkg bar")},
+		"_pkg/src/foo/bar/bar.go": &fstest.MapFile{Data: []byte(`package bar
+
+//go:embed msg.txt
+var msg string
+
+func Msg() string {
+	return msg
+}
+`)},
+	}
+
+	t.Run("EvalPath with relative paths and imports", func(t *testing.T) {
+		var stdout bytes.Buffer
+		i := interp.New(interp.Options{
+			GoPath:               "./_pkg",
+			SourcecodeFilesystem: baseFS,
+			Stdout:               &stdout,
+		})
+		if err := i.Use(stdlib.Symbols); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := i.EvalPath("app/sub/main.go"); err != nil {
+			t.Fatal(err)
+		}
+		want := "relative to app/sub|relative to app/sub|Relative to app/sub|0|from pkg bar"
+		if got := stdout.String(); got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Eval standalone and var block", func(t *testing.T) {
+		var stdout bytes.Buffer
+		i := interp.New(interp.Options{
+			SourcecodeFilesystem: baseFS,
+			Stdout:               &stdout,
+		})
+		if err := i.Use(stdlib.Symbols); err != nil {
+			t.Fatal(err)
+		}
+		src := `package main
+
+import "fmt"
+
+//go:embed hello.txt
+var s1 string
+
+//go:embed bytes.bin
+var b1 []byte
+
+var (
+	//go:embed "file with spaces.txt"
+	s2 string
+	//go:embed sub/*.dat
+	b2 []byte
+)
+
+func main() {
+	fmt.Printf("%s|%v|%s|%s", s1, b1, s2, string(b2))
+}
+`
+		if _, err := i.Eval(src); err != nil {
+			t.Fatal(err)
+		}
+		want := "hello world|[1 2 3 4]|spaced content|sub data"
+		if got := stdout.String(); got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Incremental Eval without package clause", func(t *testing.T) {
+		i := interp.New(interp.Options{
+			SourcecodeFilesystem: baseFS,
+		})
+		if _, err := i.Eval("//go:embed hello.txt\nvar s string"); err != nil {
+			t.Fatal(err)
+		}
+		res, err := i.Eval("s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := res.String(); got != "hello world" {
+			t.Fatalf("got %q, want %q", got, "hello world")
+		}
+	})
+
+	errCases := []struct {
+		name string
+		src  string
+	}{
+		{
+			name: "missing file (0 matches)",
+			src: `package main
+//go:embed nonexistent.txt
+var s string`,
+		},
+		{
+			name: "multiple matches (>1 files)",
+			src: `package main
+//go:embed sub/*.txt
+var s string`,
+		},
+		{
+			name: "directory match",
+			src: `package main
+//go:embed sub
+var s string`,
+		},
+		{
+			name: "invalid glob pattern",
+			src: `package main
+//go:embed [bad
+var s string`,
+		},
+		{
+			name: "empty pattern",
+			src: `package main
+//go:embed
+var s string`,
+		},
+		{
+			name: "parent directory pattern",
+			src: `package main
+//go:embed ../hello.txt
+var s string`,
+		},
+		{
+			name: "dot pattern",
+			src: `package main
+//go:embed .
+var s string`,
+		},
+		{
+			name: "leading slash pattern",
+			src: `package main
+//go:embed /hello.txt
+var s string`,
+		},
+		{
+			name: "multiple patterns on one line",
+			src: `package main
+//go:embed hello.txt bytes.bin
+var s string`,
+		},
+		{
+			name: "multiple go:embed directives on one var",
+			src: `package main
+//go:embed hello.txt
+//go:embed bytes.bin
+var s string`,
+		},
+		{
+			name: "unsupported type int",
+			src: `package main
+//go:embed hello.txt
+var s int`,
+		},
+		{
+			name: "unsupported type byte array",
+			src: `package main
+//go:embed bytes.bin
+var s [4]byte`,
+		},
+		{
+			name: "unsupported type string slice",
+			src: `package main
+//go:embed hello.txt
+var s []string`,
+		},
+		{
+			name: "unsupported defined string type",
+			src: `package main
+type MyString string
+//go:embed hello.txt
+var s MyString`,
+		},
+		{
+			name: "unsupported defined byte slice type",
+			src: `package main
+type MyBytes []byte
+//go:embed hello.txt
+var s MyBytes`,
+		},
+		{
+			name: "unsupported embed.FS type",
+			src: `package main
+import "embed"
+//go:embed hello.txt
+var s embed.FS`,
+		},
+		{
+			name: "var with initializer",
+			src: `package main
+//go:embed hello.txt
+var s string = "init"`,
+		},
+		{
+			name: "var with inferred type initializer",
+			src: `package main
+//go:embed hello.txt
+var s = "init"`,
+		},
+		{
+			name: "multiple vars in spec",
+			src: `package main
+//go:embed hello.txt
+var a, b string`,
+		},
+		{
+			name: "local var inside func",
+			src: `package main
+func main() {
+	//go:embed hello.txt
+	var s string
+	_ = s
+}`,
+		},
+		{
+			name: "short var decl inside func",
+			src: `package main
+func main() {
+	//go:embed hello.txt
+	s := ""
+	_ = s
+}`,
+		},
+		{
+			name: "on const decl",
+			src: `package main
+//go:embed hello.txt
+const s string = "a"`,
+		},
+		{
+			name: "on func decl",
+			src: `package main
+//go:embed hello.txt
+func foo() {}`,
+		},
+		{
+			name: "on type decl",
+			src: `package main
+//go:embed hello.txt
+type T string`,
+		},
+		{
+			name: "on var block header",
+			src: `package main
+//go:embed hello.txt
+var (
+	s string
+)`,
+		},
+		{
+			name: "blank line between directive and var",
+			src: `package main
+//go:embed hello.txt
+
+var s string`,
+		},
+	}
+
+	for _, tc := range errCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			i := interp.New(interp.Options{
+				SourcecodeFilesystem: baseFS,
+			})
+			if _, err := i.Eval(tc.src); err == nil {
+				t.Fatalf("expected error for %s, got nil", tc.name)
+			}
+		})
+	}
 }

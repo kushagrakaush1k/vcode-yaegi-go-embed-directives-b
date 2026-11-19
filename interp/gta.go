@@ -1,7 +1,10 @@
 package interp
 
 import (
+	"io/fs"
 	"path"
+	"path/filepath"
+	"reflect"
 )
 
 // gta performs a global types analysis on the AST, registering types,
@@ -123,11 +126,24 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 					return false
 				}
 			}
+			if pattern, ok := n.meta.(string); ok {
+				if err = interp.loadEmbed(n, pattern); err != nil {
+					return false
+				}
+			}
 			for _, c := range n.child[:l] {
 				asImportName := path.Join(c.ident, baseName)
 				sym, exists := sc.sym[asImportName]
 				if !exists {
-					sc.sym[c.ident] = &symbol{index: sc.add(n.typ), kind: varSym, global: true, typ: n.typ, node: n}
+					index := sc.add(n.typ)
+					sc.sym[c.ident] = &symbol{index: index, kind: varSym, global: true, typ: n.typ, node: n}
+					if n.rval.IsValid() {
+						interp.universe.types = sc.types
+						interp.frame.mutex.Lock()
+						interp.resizeFrame()
+						interp.frame.data[index].Set(n.rval)
+						interp.frame.mutex.Unlock()
+					}
 					continue
 				}
 				c.level = globalFrame
@@ -409,7 +425,7 @@ func (interp *Interpreter) gtaRetry(nodes []*node, importPath, pkgName string) e
 	if len(revisit) > 0 {
 		n := revisit[0]
 		switch n.kind {
-		case typeSpec, typeSpecAssign:
+		case typeSpec, typeSpecAssign, valueSpec:
 			if err := definedType(n.typ); err != nil {
 				return err
 			}
@@ -450,12 +466,67 @@ func definedType(typ *itype) error {
 			return err
 		}
 		fallthrough
-	case linkedT, arrayT, chanT, chanSendT, chanRecvT, ptrT, variadicT:
+	case linkedT, arrayT, sliceT, chanT, chanSendT, chanRecvT, ptrT, variadicT:
 		if err := definedType(typ.val); err != nil {
 			return err
 		}
 	case nilT:
 		return typ.node.cfgErrorf("undefined: %s", typ.node.ident)
+	}
+	return nil
+}
+
+func (interp *Interpreter) loadEmbed(n *node, pattern string) error {
+	isPlainString := n.typ.cat == stringT && n.typ.path == ""
+	isByteSlice := n.typ.cat == sliceT && n.typ.path == "" && n.typ.val != nil && n.typ.val.cat == uint8T && n.typ.val.path == ""
+	if !isPlainString && !isByteSlice {
+		return n.cfgErrorf("go:embed cannot apply to var of type %s", n.typ.id())
+	}
+	if pattern == "" || pattern == "." || !fs.ValidPath(pattern) {
+		return n.cfgErrorf("pattern %s: invalid pattern syntax", pattern)
+	}
+	if _, err := path.Match(pattern, ""); err != nil {
+		return n.cfgErrorf("pattern %s: %v", pattern, err)
+	}
+
+	filename := interp.fset.Position(n.pos).Filename
+	dir := "."
+	if filename != "" && filename != DefaultSourceName {
+		dir = path.Dir(filepath.ToSlash(filename))
+	}
+	fullPattern := path.Join(dir, pattern)
+
+	matches, err := fs.Glob(interp.filesystem, fullPattern)
+	if err != nil {
+		return n.cfgErrorf("pattern %s: %v", pattern, err)
+	}
+	if len(matches) == 0 {
+		return n.cfgErrorf("pattern %s: no matching files found", pattern)
+	}
+	if len(matches) > 1 {
+		return n.cfgErrorf("pattern %s: cannot embed multiple files", pattern)
+	}
+
+	fi, err := fs.Stat(interp.filesystem, matches[0])
+	if err != nil {
+		return n.cfgErrorf("pattern %s: %v", pattern, err)
+	}
+	if fi.IsDir() {
+		return n.cfgErrorf("pattern %s: cannot embed directory %s", pattern, matches[0])
+	}
+	if !fi.Mode().IsRegular() {
+		return n.cfgErrorf("pattern %s: cannot embed irregular file %s", pattern, matches[0])
+	}
+
+	data, err := fs.ReadFile(interp.filesystem, matches[0])
+	if err != nil {
+		return n.cfgErrorf("pattern %s: %v", pattern, err)
+	}
+
+	if isPlainString {
+		n.rval = reflect.ValueOf(string(data))
+	} else {
+		n.rval = reflect.ValueOf(data)
 	}
 	return nil
 }
