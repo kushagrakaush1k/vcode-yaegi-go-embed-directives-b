@@ -2189,6 +2189,80 @@ func main() {
 		}
 	})
 
+	t.Run("directory and patterns in a subfolder with dot, underscore, and all:", func(t *testing.T) {
+		subFS := fstest.MapFS{
+			"pkg/sub/assets/a.txt":        &fstest.MapFile{Data: []byte("alpha")},
+			"pkg/sub/assets/b.txt":        &fstest.MapFile{Data: []byte("beta")},
+			"pkg/sub/assets/c.dat":        &fstest.MapFile{Data: []byte("gamma")},
+			"pkg/sub/assets/.dot":         &fstest.MapFile{Data: []byte("dotVal")},
+			"pkg/sub/assets/_under":       &fstest.MapFile{Data: []byte("underVal")},
+			"pkg/sub/assets/.dirdot/x":    &fstest.MapFile{Data: []byte("dirdotX")},
+			"pkg/sub/assets/_dirunder/y":  &fstest.MapFile{Data: []byte("dirunderY")},
+			"pkg/sub/assets/inner/z.txt":  &fstest.MapFile{Data: []byte("innerZ")},
+			"pkg/sub/main.go": &fstest.MapFile{Data: []byte(`package main
+
+import (
+	"embed"
+	"fmt"
+	"strings"
+)
+
+//go:embed assets
+var dirOnly embed.FS
+
+//go:embed assets/*.txt assets/inner/*.txt
+var patOnly embed.FS
+
+//go:embed all:assets
+var allAssets embed.FS
+
+//go:embed all:assets/.dot
+var dotStr string
+
+//go:embed all:assets/_under
+var underBytes []byte
+
+func listNames(f embed.FS, dir string) string {
+	entries, err := f.ReadDir(dir)
+	if err != nil {
+		panic(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return strings.Join(names, ",")
+}
+
+func main() {
+	fmt.Printf("dir=%s|pat=%s|inner=%s|all=%s|dot=%s|under=%s",
+		listNames(dirOnly, "assets"),
+		listNames(patOnly, "assets"),
+		listNames(patOnly, "assets/inner"),
+		listNames(allAssets, "assets"),
+		dotStr,
+		string(underBytes),
+	)
+}
+`)},
+		}
+		var stdout bytes.Buffer
+		i := interp.New(interp.Options{
+			SourcecodeFilesystem: subFS,
+			Stdout:               &stdout,
+		})
+		if err := i.Use(stdlib.Symbols); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := i.EvalPath("pkg/sub/main.go"); err != nil {
+			t.Fatal(err)
+		}
+		want := "dir=a.txt,b.txt,c.dat,inner|pat=a.txt,b.txt,inner|inner=z.txt|all=.dirdot,.dot,_dirunder,_under,a.txt,b.txt,c.dat,inner|dot=dotVal|under=underVal"
+		if got := stdout.String(); got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
+
 	errCases := []struct {
 		name string
 		src  string
