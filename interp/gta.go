@@ -1,10 +1,14 @@
 package interp
 
 import (
+	"embed"
 	"io/fs"
 	"path"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
+	"unsafe"
 )
 
 // gta performs a global types analysis on the AST, registering types,
@@ -126,8 +130,8 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 					return false
 				}
 			}
-			if pattern, ok := n.meta.(string); ok {
-				if err = interp.loadEmbed(n, pattern); err != nil {
+			if patterns, ok := n.meta.([]string); ok {
+				if err = interp.loadEmbed(n, patterns); err != nil {
 					return false
 				}
 			}
@@ -476,17 +480,60 @@ func definedType(typ *itype) error {
 	return nil
 }
 
-func (interp *Interpreter) loadEmbed(n *node, pattern string) error {
+type embedFS struct {
+	files *[]embedFile
+}
+
+type embedFile struct {
+	name string
+	data string
+	hash [16]byte
+}
+
+func embedFileNameSplit(name string) (dir, elem string, isDir bool) {
+	if strings.HasSuffix(name, "/") {
+		isDir = true
+		name = name[:len(name)-1]
+	}
+	i := strings.LastIndexByte(name, '/')
+	if i < 0 {
+		return ".", name, isDir
+	}
+	return name[:i], name[i+1:], isDir
+}
+
+func embedFileLess(x, y string) bool {
+	xdir, xelem, _ := embedFileNameSplit(x)
+	ydir, yelem, _ := embedFileNameSplit(y)
+	return xdir < ydir || (xdir == ydir && xelem < yelem)
+}
+
+func relEmbedPath(dir, p string) string {
+	if dir == "." || dir == "" {
+		return p
+	}
+	prefix := strings.TrimSuffix(path.Clean(dir), "/") + "/"
+	return strings.TrimPrefix(p, prefix)
+}
+
+func hasHiddenElem(rel string) bool {
+	for _, elem := range strings.Split(rel, "/") {
+		if strings.HasPrefix(elem, ".") || strings.HasPrefix(elem, "_") {
+			return true
+		}
+	}
+	return false
+}
+
+func (interp *Interpreter) loadEmbed(n *node, patterns []string) error {
 	isPlainString := n.typ.cat == stringT && n.typ.path == ""
 	isByteSlice := n.typ.cat == sliceT && n.typ.path == "" && n.typ.val != nil && n.typ.val.cat == uint8T && n.typ.val.path == ""
-	if !isPlainString && !isByteSlice {
+	isEmbedFS := n.typ.cat == valueT && n.typ.path == "" && n.typ.rtype == reflect.TypeOf(embed.FS{})
+	if !isPlainString && !isByteSlice && !isEmbedFS {
 		return n.cfgErrorf("go:embed cannot apply to var of type %s", n.typ.id())
 	}
-	if pattern == "" || pattern == "." || !fs.ValidPath(pattern) {
-		return n.cfgErrorf("pattern %s: invalid pattern syntax", pattern)
-	}
-	if _, err := path.Match(pattern, ""); err != nil {
-		return n.cfgErrorf("pattern %s: %v", pattern, err)
+	if !isEmbedFS && len(patterns) > 1 {
+		return n.cfgErrorf("invalid go:embed: multiple patterns for type %s", n.typ.id())
 	}
 
 	filename := interp.fset.Position(n.pos).Filename
@@ -494,40 +541,137 @@ func (interp *Interpreter) loadEmbed(n *node, pattern string) error {
 	if filename != "" && filename != DefaultSourceName {
 		dir = path.Dir(filepath.ToSlash(filename))
 	}
-	fullPattern := path.Join(dir, pattern)
 
-	matches, err := fs.Glob(interp.filesystem, fullPattern)
-	if err != nil {
-		return n.cfgErrorf("pattern %s: %v", pattern, err)
-	}
-	if len(matches) == 0 {
-		return n.cfgErrorf("pattern %s: no matching files found", pattern)
-	}
-	if len(matches) > 1 {
-		return n.cfgErrorf("pattern %s: cannot embed multiple files", pattern)
+	haveFile := map[string]bool{}
+	var relFiles []string
+
+	for _, pattern := range patterns {
+		glob := pattern
+		all := false
+		if strings.HasPrefix(glob, "all:") {
+			all = true
+			glob = glob[len("all:"):]
+		}
+		if glob == "" || glob == "." || !fs.ValidPath(glob) {
+			return n.cfgErrorf("pattern %s: invalid pattern syntax", pattern)
+		}
+		if _, err := path.Match(glob, ""); err != nil {
+			return n.cfgErrorf("pattern %s: %v", pattern, err)
+		}
+
+		fullPattern := path.Join(dir, glob)
+		matches, err := fs.Glob(interp.filesystem, fullPattern)
+		if err != nil {
+			return n.cfgErrorf("pattern %s: %v", pattern, err)
+		}
+		if len(matches) == 0 {
+			return n.cfgErrorf("pattern %s: no matching files found", pattern)
+		}
+
+		patternCount := 0
+		for _, match := range matches {
+			rel := relEmbedPath(dir, match)
+			if !all && hasHiddenElem(rel) {
+				continue
+			}
+
+			fi, err := fs.Stat(interp.filesystem, match)
+			if err != nil {
+				return n.cfgErrorf("pattern %s: %v", pattern, err)
+			}
+			if fi.IsDir() {
+				if !isEmbedFS {
+					return n.cfgErrorf("pattern %s: cannot embed directory %s", pattern, match)
+				}
+				err = fs.WalkDir(interp.filesystem, match, func(p string, d fs.DirEntry, err error) error {
+					if err != nil {
+						return err
+					}
+					if p != match {
+						name := d.Name()
+						if !all && (strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")) {
+							if d.IsDir() {
+								return fs.SkipDir
+							}
+							return nil
+						}
+					}
+					if d.IsDir() {
+						return nil
+					}
+					info, err := d.Info()
+					if err != nil {
+						return err
+					}
+					if !info.Mode().IsRegular() {
+						return nil
+					}
+					frel := relEmbedPath(dir, p)
+					patternCount++
+					if !haveFile[frel] {
+						haveFile[frel] = true
+						relFiles = append(relFiles, frel)
+					}
+					return nil
+				})
+				if err != nil {
+					return n.cfgErrorf("pattern %s: %v", pattern, err)
+				}
+				continue
+			}
+			if !fi.Mode().IsRegular() {
+				return n.cfgErrorf("pattern %s: cannot embed irregular file %s", pattern, match)
+			}
+			patternCount++
+			if !haveFile[rel] {
+				haveFile[rel] = true
+				relFiles = append(relFiles, rel)
+			}
+		}
+		if patternCount == 0 {
+			return n.cfgErrorf("pattern %s: no matching files found", pattern)
+		}
 	}
 
-	fi, err := fs.Stat(interp.filesystem, matches[0])
-	if err != nil {
-		return n.cfgErrorf("pattern %s: %v", pattern, err)
-	}
-	if fi.IsDir() {
-		return n.cfgErrorf("pattern %s: cannot embed directory %s", pattern, matches[0])
-	}
-	if !fi.Mode().IsRegular() {
-		return n.cfgErrorf("pattern %s: cannot embed irregular file %s", pattern, matches[0])
+	if !isEmbedFS {
+		if len(relFiles) != 1 {
+			return n.cfgErrorf("invalid go:embed: multiple files for type %s", n.typ.id())
+		}
+		data, err := fs.ReadFile(interp.filesystem, path.Join(dir, relFiles[0]))
+		if err != nil {
+			return n.cfgErrorf("embed %s: %v", relFiles[0], err)
+		}
+		if isPlainString {
+			n.rval = reflect.ValueOf(string(data))
+		} else {
+			n.rval = reflect.ValueOf(data)
+		}
+		return nil
 	}
 
-	data, err := fs.ReadFile(interp.filesystem, matches[0])
-	if err != nil {
-		return n.cfgErrorf("pattern %s: %v", pattern, err)
+	haveDir := map[string]bool{}
+	var files []embedFile
+	for _, rel := range relFiles {
+		data, err := fs.ReadFile(interp.filesystem, path.Join(dir, rel))
+		if err != nil {
+			return n.cfgErrorf("embed %s: %v", rel, err)
+		}
+		files = append(files, embedFile{
+			name: rel,
+			data: string(data),
+		})
+		for d := path.Dir(rel); d != "." && !haveDir[d]; d = path.Dir(d) {
+			haveDir[d] = true
+			files = append(files, embedFile{
+				name: d + "/",
+			})
+		}
 	}
-
-	if isPlainString {
-		n.rval = reflect.ValueOf(string(data))
-	} else {
-		n.rval = reflect.ValueOf(data)
-	}
+	sort.Slice(files, func(i, j int) bool {
+		return embedFileLess(files[i].name, files[j].name)
+	})
+	efs := *(*embed.FS)(unsafe.Pointer(&embedFS{files: &files}))
+	n.rval = reflect.ValueOf(efs)
 	return nil
 }
 

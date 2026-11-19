@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"unicode"
 )
 
 // nkind defines the kind of AST, i.e. the grammar category.
@@ -924,7 +925,7 @@ func (interp *Interpreter) ast(f ast.Node) (string, *node, error) {
 					}
 				}
 			}
-			var embedPattern string
+			var embedPatterns []string
 			var hasEmbed bool
 			if len(embedComments) > 0 {
 				switch {
@@ -937,17 +938,18 @@ func (interp *Interpreter) ast(f ast.Node) (string, *node, error) {
 				case len(a.Values) > 0 || a.Type == nil:
 					err = astError(fmt.Errorf("%s: go:embed cannot apply to var with initializer", interp.fset.Position(pos)))
 					return false
-				case len(embedComments) > 1:
-					err = astError(fmt.Errorf("%s: go:embed cannot apply multiple directives to var", interp.fset.Position(pos)))
-					return false
 				}
-				arg, _ := isEmbedComment(embedComments[0].Text)
-				embedPattern, err = parseEmbedPattern(arg)
-				if err != nil {
-					err = astError(fmt.Errorf("%s: %w", interp.fset.Position(embedComments[0].Pos()), err))
-					return false
+				for _, c := range embedComments {
+					arg, _ := isEmbedComment(c.Text)
+					var pats []string
+					pats, err = parseEmbedPatterns(arg)
+					if err != nil {
+						err = astError(fmt.Errorf("%s: %w", interp.fset.Position(c.Pos()), err))
+						return false
+					}
+					embedPatterns = append(embedPatterns, pats...)
+					validEmbedComments[c] = true
 				}
-				validEmbedComments[embedComments[0]] = true
 				hasEmbed = true
 			}
 			kind := valueSpec
@@ -978,7 +980,7 @@ func (interp *Interpreter) ast(f ast.Node) (string, *node, error) {
 			n.nleft = len(a.Names)
 			n.nright = len(a.Values)
 			if hasEmbed {
-				n.meta = embedPattern
+				n.meta = embedPatterns
 			}
 			st.push(n, nod)
 
@@ -1023,28 +1025,42 @@ func isEmbedComment(text string) (string, bool) {
 	return "", false
 }
 
-func parseEmbedPattern(arg string) (string, error) {
-	if arg == "" {
-		return "", fmt.Errorf("invalid go:embed: missing pattern")
+func parseEmbedPatterns(args string) ([]string, error) {
+	args = strings.TrimLeftFunc(args, unicode.IsSpace)
+	if args == "" {
+		return nil, fmt.Errorf("invalid go:embed: missing pattern")
 	}
-	if arg[0] == '"' || arg[0] == '`' {
-		q, err := strconv.QuotedPrefix(arg)
-		if err != nil {
-			return "", fmt.Errorf("invalid go:embed: %w", err)
+	var list []string
+	for args != "" {
+		var pat string
+		switch args[0] {
+		case '`', '"':
+			q, err := strconv.QuotedPrefix(args)
+			if err != nil {
+				return nil, fmt.Errorf("invalid go:embed: %w", err)
+			}
+			pat, err = strconv.Unquote(q)
+			if err != nil {
+				return nil, fmt.Errorf("invalid go:embed: %w", err)
+			}
+			args = args[len(q):]
+			if args != "" && !unicode.IsSpace(rune(args[0])) {
+				return nil, fmt.Errorf("invalid go:embed: invalid quoted string")
+			}
+		default:
+			i := strings.IndexFunc(args, unicode.IsSpace)
+			if i < 0 {
+				pat = args
+				args = ""
+			} else {
+				pat = args[:i]
+				args = args[i:]
+			}
 		}
-		if strings.TrimSpace(arg[len(q):]) != "" {
-			return "", fmt.Errorf("invalid go:embed: multiple patterns not supported")
-		}
-		pat, err := strconv.Unquote(q)
-		if err != nil {
-			return "", fmt.Errorf("invalid go:embed: %w", err)
-		}
-		return pat, nil
+		list = append(list, pat)
+		args = strings.TrimLeftFunc(args, unicode.IsSpace)
 	}
-	if strings.ContainsAny(arg, " \t") {
-		return "", fmt.Errorf("invalid go:embed: multiple patterns not supported")
-	}
-	return arg, nil
+	return list, nil
 }
 
 type astNode struct {

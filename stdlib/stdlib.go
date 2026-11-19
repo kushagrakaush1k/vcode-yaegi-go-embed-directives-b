@@ -3,7 +3,10 @@
 // Package stdlib provides wrappers of standard library packages to be imported natively in Yaegi.
 package stdlib
 
-import "reflect"
+import (
+	"embed"
+	"reflect"
+)
 
 // Symbols variable stores the map of stdlib symbols per package.
 var Symbols = map[string]map[string]reflect.Value{}
@@ -18,6 +21,9 @@ func init() {
 	}
 	Symbols["."] = map[string]reflect.Value{
 		"MapTypes": reflect.ValueOf(MapTypes),
+	}
+	Symbols["embed/embed"] = map[string]reflect.Value{
+		"FS": reflect.ValueOf((*embed.FS)(nil)),
 	}
 }
 

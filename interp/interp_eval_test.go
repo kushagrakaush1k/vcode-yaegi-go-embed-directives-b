@@ -1940,6 +1940,12 @@ func TestEmbed(t *testing.T) {
 		"sub/only.dat":         &fstest.MapFile{Data: []byte("sub data")},
 		"sub/multi1.txt":       &fstest.MapFile{Data: []byte("m1")},
 		"sub/multi2.txt":       &fstest.MapFile{Data: []byte("m2")},
+		"sub/.hidden":          &fstest.MapFile{Data: []byte("dot hidden")},
+		"sub/_ignored":         &fstest.MapFile{Data: []byte("underscore hidden")},
+		"sub/.dotdir/in.txt":   &fstest.MapFile{Data: []byte("inside dotdir")},
+		"sub/_undir/in.txt":    &fstest.MapFile{Data: []byte("inside undir")},
+		"sub/nested/deep.txt":  &fstest.MapFile{Data: []byte("deep content")},
+		"onlyhidden/.secret":   &fstest.MapFile{Data: []byte("secret")},
 		"app/sub/data.txt":     &fstest.MapFile{Data: []byte("relative to app/sub")},
 		"app/sub/main.go": &fstest.MapFile{Data: []byte(`package main
 
@@ -2056,6 +2062,133 @@ func main() {
 		}
 	})
 
+	t.Run("embed.FS interfaces, ReadDir order, ReadDirFile, ReadFile fresh buffer, multi-line and all:", func(t *testing.T) {
+		var stdout bytes.Buffer
+		i := interp.New(interp.Options{
+			SourcecodeFilesystem: baseFS,
+			Stdout:               &stdout,
+		})
+		if err := i.Use(stdlib.Symbols); err != nil {
+			t.Fatal(err)
+		}
+		src := `package main
+
+import (
+	"embed"
+	"fmt"
+	"io/fs"
+	"strings"
+)
+
+//go:embed hello.txt "file with spaces.txt"
+//go:embed sub
+var fsys embed.FS
+
+//go:embed all:sub
+var allFsys embed.FS
+
+func main() {
+	var _ fs.FS = fsys
+	var _ fs.ReadFileFS = fsys
+	var _ fs.ReadDirFS = fsys
+
+	// ReadFile must not return the same buffer twice
+	b1, err := fsys.ReadFile("hello.txt")
+	if err != nil {
+		panic(err)
+	}
+	b1[0] = 'X'
+	b2, err := fsys.ReadFile("hello.txt")
+	if err != nil {
+		panic(err)
+	}
+	if string(b2) != "hello world" {
+		panic("ReadFile returned mutated buffer: " + string(b2))
+	}
+
+	// Root ReadDir in name order
+	rootEntries, err := fsys.ReadDir(".")
+	if err != nil {
+		panic(err)
+	}
+	var rootNames []string
+	for _, e := range rootEntries {
+		rootNames = append(rootNames, e.Name())
+	}
+
+	// Open directory returns fs.ReadDirFile
+	dirFile, err := fsys.Open("sub")
+	if err != nil {
+		panic(err)
+	}
+	defer dirFile.Close()
+	rdf, ok := dirFile.(fs.ReadDirFile)
+	if !ok {
+		panic("Open on directory did not implement fs.ReadDirFile")
+	}
+	subEntries, err := rdf.ReadDir(-1)
+	if err != nil {
+		panic(err)
+	}
+	var subNames []string
+	for _, e := range subEntries {
+		subNames = append(subNames, e.Name())
+	}
+
+	// Nested file inside sub
+	deepBytes, err := fsys.ReadFile("sub/nested/deep.txt")
+	if err != nil {
+		panic(err)
+	}
+
+	// Hidden files skipped in fsys
+	if _, err := fsys.Open("sub/.hidden"); err == nil {
+		panic("expected sub/.hidden to be skipped without all:")
+	}
+	if _, err := fsys.Open("sub/_ignored"); err == nil {
+		panic("expected sub/_ignored to be skipped without all:")
+	}
+	if _, err := fsys.Open("sub/.dotdir/in.txt"); err == nil {
+		panic("expected sub/.dotdir/in.txt to be skipped without all:")
+	}
+
+	// Hidden files included in allFsys with all:
+	allEntries, err := allFsys.ReadDir("sub")
+	if err != nil {
+		panic(err)
+	}
+	var allNames []string
+	for _, e := range allEntries {
+		allNames = append(allNames, e.Name())
+	}
+	dotData, err := allFsys.ReadFile("sub/.dotdir/in.txt")
+	if err != nil {
+		panic(err)
+	}
+	unData, err := allFsys.ReadFile("sub/_undir/in.txt")
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("root=%s|sub=%s|deep=%s|all=%s|dot=%s|un=%s",
+		strings.Join(rootNames, ","),
+		strings.Join(subNames, ","),
+		string(deepBytes),
+		strings.Join(allNames, ","),
+		string(dotData),
+		string(unData),
+	)
+}
+`
+		if _, err := i.Eval(src); err != nil {
+			t.Fatal(err)
+		}
+		want := "root=file with spaces.txt,hello.txt,sub|sub=multi1.txt,multi2.txt,nested,only.dat|deep=deep content|all=.dotdir,.hidden,_ignored,_undir,multi1.txt,multi2.txt,nested,only.dat|dot=inside dotdir|un=inside undir"
+		if got := stdout.String(); got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
+
 	errCases := []struct {
 		name string
 		src  string
@@ -2067,13 +2200,13 @@ func main() {
 var s string`,
 		},
 		{
-			name: "multiple matches (>1 files)",
+			name: "multiple matches (>1 files) for string",
 			src: `package main
 //go:embed sub/*.txt
 var s string`,
 		},
 		{
-			name: "directory match",
+			name: "directory match for string",
 			src: `package main
 //go:embed sub
 var s string`,
@@ -2109,17 +2242,31 @@ var s string`,
 var s string`,
 		},
 		{
-			name: "multiple patterns on one line",
+			name: "multiple patterns on one line for string",
 			src: `package main
 //go:embed hello.txt bytes.bin
 var s string`,
 		},
 		{
-			name: "multiple go:embed directives on one var",
+			name: "multiple go:embed directives on one var for string",
 			src: `package main
 //go:embed hello.txt
 //go:embed bytes.bin
 var s string`,
+		},
+		{
+			name: "embed.FS with one valid pattern and one non-matching pattern",
+			src: `package main
+import "embed"
+//go:embed hello.txt nonexistent.txt
+var f embed.FS`,
+		},
+		{
+			name: "embed.FS directory with only hidden files without all:",
+			src: `package main
+import "embed"
+//go:embed onlyhidden
+var f embed.FS`,
 		},
 		{
 			name: "unsupported type int",
@@ -2154,11 +2301,12 @@ type MyBytes []byte
 var s MyBytes`,
 		},
 		{
-			name: "unsupported embed.FS type",
+			name: "unsupported defined embed.FS type",
 			src: `package main
 import "embed"
+type MyFS embed.FS
 //go:embed hello.txt
-var s embed.FS`,
+var s MyFS`,
 		},
 		{
 			name: "var with initializer",
